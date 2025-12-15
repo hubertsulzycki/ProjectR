@@ -1,0 +1,294 @@
+---
+title: "Projekt R"
+author: "Hubert Sulżycki"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# 1. Executive Summary
+
+**Project Overview** This report provides a analysis of graphene-based supercapacitor electrodes, focusing on the relationship between material structure (e.g., Specific Surface Area), testing conditions (e.g., Current Density), and the resulting performance (Capacitance). The dataset contains experimental results from various scientific publications.
+
+**Key Findings:**
+
+1.  **Data Quality & Availability:** The raw dataset contains significant gaps. Key structural parameters like *Pore Size* and *Pore Volume* had missing rates exceeding 70%, wchich resulten in their exclusion to gain reliable results. The analysis focuses on the robust features that remained: Specific Surface Area (SSA) and chemical composition.
+
+2.  **Structure-Performance Relationship:** Visual analysis confirms a positive correlation between **Specific Surface Area (SSA)** and **Capacitance**. However, this relationship is non-linear and heavily influenced by the **Current Density**. Higher current densities generally lead to lower capacitance, indicating diffusion limitations in the material.
+
+3.  A Random Forest algorithm was trained to predict capacitance. Critically, **voltage window parameters were excluded** to prevent data leakage and force the model to learn from material properties. The refined model demonstrates that performance is a complex interplay between the testing load and the physical structure of the graphene.
+
+4.  **Key Drivers (XAI Insights):**
+    Feature importance analysis reveals the hierarchy of influence:
+    * **Ratio of ID/IG (Defect Density):** The #1 predictor. This indicates that structural defects in graphene are not failures, but rather "active sites" that significantly boost charge storage (likely via pseudocapacitance).
+    * **Electrolyte Properties:** Both *Concentration* and *Ionic Conductivity* rank higher than mechanical load. This highlights that ion availability and mobility are just as critical as the solid material structure.
+    * **Specific Surface Area (SSA):** Remains a key factor, but acts in support of the defects and electrolyte chemistry.
+
+
+# 2. Libraries
+```{r libraries}
+library(tidyverse)
+library(janitor)
+library(randomForest)
+library(DALEX)
+library(ggcorrplot)
+library(plotly)
+library(DT)
+```
+
+# 3. Repeatability seed
+```{r seed}
+set.seed(1)
+```
+
+# 4. Reading data
+```{r import}
+df <- read_csv("data.csv")
+```
+
+# 5. Data overview
+
+## 5.1. Data presentation
+```{r data}
+datatable(df, 
+          extensions = 'Buttons',
+          options = list(pageLength = 5, scrollX = TRUE, dom = 'Bfrtip', buttons = c('copy', 'csv', 'excel', 'pdf', 'print')))
+```
+
+## 5.2. Data structure
+```{r data_structure}
+data_structure <- tibble(
+  Variable = names(df),
+  `Data types` = sapply(df, function(x) paste(class(x), collapse = "/")),
+  `Unique values` = sapply(df, function(x) length(unique(x))),
+  `Missing values` = sapply(df, function(x) sum(is.na(x))),
+  `# of missing values` = sapply(df, function(x) round(sum(is.na(x)) / nrow(df) * 100, 1))
+) %>%
+  arrange(desc(`# of missing values`))
+
+datatable(data_structure,
+          extensions = 'Buttons',
+          rownames = FALSE,
+          options = list(
+            dom = 'Bt',
+            pageLength = 25,
+            buttons = c('copy', 'csv', 'excel')
+          )) %>%
+  formatStyle('# of missing values',
+              background = styleColorBar(range(data_structure$`# of missing values`), 'salmon'),
+              backgroundSize = '90% 80%',
+              backgroundRepeat = 'no-repeat',
+              backgroundPosition = 'center')
+```
+The chart above reveals a critical issue: variables such as *Pore Size*, *Pore Volume*, and *Charge Transfer Resistance (Rct)* etc. are missing in over 70% of the records. Including these variables would severely reduce the sample size or introduce too much noise via imputation.
+
+## 5.3. Cleaning missing numeric values
+**Strategy:**
+
+1.  **Target Filter**: Remove rows where the target variable *Capacitance* is missing.
+
+2.  **Column Filter**: Remove columns with >70% missing data (to preserve Specific Surface Area but drop empty columns).
+
+3.  **Imputation**: Fill remaining gaps in numeric columns using the Median, which is robust against outliers common in experimental data.
+```{r data_cleaning}
+threshold <- 0.7
+df <- df %>% filter(!is.na(`Capacitance (F/g)`))
+
+df_reduced <- df %>%
+  select(where(~ mean(is.na(.)) <= threshold)) %>%
+  mutate(across(where(is.numeric), 
+                ~ifelse(is.na(.), median(., na.rm = TRUE), .)))
+```
+
+## 5.4. Overwiew of data statistical measures
+```{r statistical_measures}
+
+stats <- df_reduced %>%
+  select(where(is.numeric)) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Value") %>%
+  group_by(Variable) %>%
+  summarise(
+    Min = min(Value, na.rm = TRUE),
+    Q1 = quantile(Value, 0.25, na.rm = TRUE),
+    Median = median(Value, na.rm = TRUE),
+    Avarage = mean(Value, na.rm = TRUE),
+    Q3 = quantile(Value, 0.75, na.rm = TRUE),
+    Max = max(Value, na.rm = TRUE),
+    SD = sd(Value, na.rm = TRUE)
+  ) %>%
+  mutate(across(where(is.numeric), ~round(., 2)))
+
+datatable(stats, 
+          caption = "Statistical measures before cleaning missing values",
+          extensions = 'Buttons',
+          options = list(
+            dom = 'Bfrtip',
+            pageLength = 10,
+            scrollX = TRUE,
+            buttons = c('copy', 'csv', 'excel', 'pdf', 'print')
+          ))
+
+```
+## 5.5. Distribution Analysis (Before vs After)
+We compare the distributions to ensure that replacing missing values with the median did not distort the data significantly.
+```{r histograms, fig.height=5, fig.width=8}
+numeric_cols <- df_reduced %>% 
+  select(where(is.numeric)) %>% 
+  names()
+
+for(col_name in numeric_cols) {
+  
+  raw_values <- df[[col_name]]
+  clean_values <- df_reduced[[col_name]]
+  
+  plot_data <- data.frame(
+    Wartosc = c(raw_values, clean_values),
+    Typ = c(rep("1. Before cleaning missing data", length(raw_values)),
+            rep("2. After cleaning missing data", length(clean_values)))
+  )
+  
+ p <- ggplot(plot_data, aes(x = Wartosc, fill = Typ)) +
+    geom_histogram(bins = 30, color = "white", alpha = 0.8) +
+    facet_wrap(~Typ, scales = "free_y") + 
+    scale_fill_manual(values = c("salmon", "salmon")) + 
+    labs(
+      title = paste("Histogram:", col_name),
+      x = col_name,
+      y = "Number of observations"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(size = 12, face = "bold"),
+      legend.position = "none"
+    )
+  print(p)
+}
+
+```
+The histograms confirm that the general shape of distributions remains consistent. For variables like Specific Surface Area, the imputed values form a peak at the median, but the tails of the distribution (representing high-performance materials) are preserved.
+
+## 5.6. Correlation heatmap between numerical values
+```{r corelation}
+numeric_reduced <- df_reduced %>%
+  select(where(is.numeric))
+cor_matrix <- cor(numeric_reduced, use = "pairwise.complete.obs")
+
+cor_melted <- cor_matrix %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "value1") %>%
+  pivot_longer(cols = -value1, names_to = "value2", values_to = "Correlation")
+
+ggplot(cor_melted, aes(x = value1, y = value2, fill = Correlation)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0, limit = c(-1, 1)) +
+  geom_text(aes(label = round(Correlation, 2)), color = "black", size = 3) +
+  labs(
+    x = "",
+    y = "",
+    fill = "Correlation\ncoefficient"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1), 
+    axis.text.y = element_text(size = 10)
+  )
+```
+The correlation analysis shows that most relationships between graphene-based supercapacitor properties are weak to moderate, indicating that performance is controlled by multiple interacting factors rather than a single dominant parameter. Capacitance exhibits a moderate negative correlation with the overall potential window, suggesting a trade-off between achieving high capacitance and operating at higher voltages. Specific surface area is positively correlated with the potential window, implying that high-SSA graphene structures may support wider voltage stability but do not necessarily maximize capacitance. Overall, the results emphasize the need for multi-parameter optimization when designing high-performance graphene supercapacitors.
+
+
+# 6. Reletion between SSA (Specific Surface Area) and Capacitance 
+This interactive chart explores how surface area translates to capacitance under different electrolyte conditions.
+```{r trends-interactive-reduced, fig.height=7, fig.width=10}
+
+trend_data <- df_reduced %>%
+  filter(!is.na(`Electrolyte Chemical Formula`)) %>%
+  mutate(Electrolyte_Group = fct_lump(`Electrolyte Chemical Formula`, n = 5, other_level = "Other"))
+
+p_trend <- ggplot(trend_data, aes(x = `Specific Surface Area (m^2/g)`, 
+                                  y = `Capacitance (F/g)`, 
+                                  color = Electrolyte_Group,
+                                  size = `Current Density (A/g)`,
+                                  text = paste("<b>Ref:</b>", `Ref.`,
+                                               "<br><b>Electrolyte:</b>", `Electrolyte Chemical Formula`,
+                                               "<br><b>Capacitance:</b>", round(`Capacitance (F/g)`, 1),
+                                               "<br><b>SSA:</b>", round(`Specific Surface Area (m^2/g)`, 0),
+                                               "<br><b>Current Density:</b>", `Current Density (A/g)`))) +
+  geom_point(alpha = 0.6) +
+  scale_size(range = c(2, 9), guide = "none") +
+  scale_color_brewer(palette = "Set1") +
+  labs(
+    x = "SSA [m^2/g]",
+    y = "Capacitance [F/g]",
+    color = "Electrolyte",
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggplotly(p_trend, tooltip = "text") %>%
+  layout(legend = list(orientation = "h", x = 0.1, y = -0.2))
+```
+The bubble chart reveals distinct clusters. We can observe that while high SSA enables high capacitance, the Current Density (bubble size) acts as a limiting factor. Large bubbles (high current) rarely appear at the very top of the Y-axis (high capacitance), illustrating the trade-off between power density and energy density.
+
+# 7. XAI
+
+## 7.1 Creating Random Forest Model
+Machine learning approach was refined by explicitly excluding "Potential Window" variables. While statistically correlated, potential limits (Voltage) are often experimental settings rather than intrinsic material properties. Including them would lead to "data leakage" (the model learns the test settings instead of the material quality).
+``` {r random_forest}
+
+data_rf <- df_reduced %>%
+  select(where(is.numeric)) %>%
+  clean_names() %>%
+  select(-matches("potential"), -matches("limit"))
+
+set.seed(123)
+sample_index <- sample(1:nrow(data_rf), 0.8 * nrow(data_rf))
+train_set <- data_rf[sample_index, ]
+test_set  <- data_rf[-sample_index, ]
+
+rf_model <- randomForest(`capacitance_f_g` ~ ., 
+                         data = train_set, 
+                         ntree = 100, 
+                         importance = TRUE)
+
+predictions <- predict(rf_model, test_set)
+```
+
+
+## 7.2 Variable importance on prediction
+```{r variable_importance}
+explainer_rf <- explain(
+  model = rf_model,
+  data = train_set[, -which(names(train_set) == "capacitance_f_g")],
+  y = train_set$capacitance_f_g,
+  verbose = FALSE
+)
+
+vip_rf <- model_parts(explainer_rf)
+
+plot(vip_rf, max_vars = 12)
+```
+By excluding the potential window, the model reveals the true drivers of material performance:
+
+1. **Ratio of ID/IG**: ID/IG represents the defect density in graphene. Its high importance suggests that defects act as active sites for charge storage (pseudocapacitance), significantly enhancing performance.
+
+2. **Electrolyte Concentration & Conductivity**: These variables rank very high, which indicates that the chemistry of the system is critical. Higher concentration ensures more ions are available to store charge, while higher conductivity ensures they can move fast enough.
+
+3. **Specific Surface Area (SSA)**: Remains a fundamental driver, validating the physical theory of double-layer capacitance.
+
+## 7.3 SHAP for the best electrode
+```{r shap}
+best_idx <- which.max(predictions)
+new_observation <- test_set[best_idx, , drop = FALSE]
+
+shap_values <- predict_parts(explainer_rf, new_observation = new_observation, type = "shap")
+
+plot(shap_values) +
+  ggtitle(paste("SHAP analysis for ", round(predictions[best_idx], 0), "F/g"))
+         
+```
